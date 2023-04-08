@@ -57,6 +57,7 @@ enum drm_mode_generation g_drmModeGeneration = DRM_MODE_GENERATE_CVT;
 enum g_panel_orientation g_drmModeOrientation = PANEL_ORIENTATION_AUTO;
 std::atomic<uint64_t> g_drmEffectiveOrientation(DRM_MODE_ROTATE_0);
 
+bool g_bForceDisableTransferFunctions = false;
 
 static LogScope drm_log("drm");
 static LogScope drm_verbose_log("drm", LOG_SILENT);
@@ -64,6 +65,33 @@ static LogScope drm_verbose_log("drm", LOG_SILENT);
 static std::map< std::string, std::string > pnps = {};
 
 drm_screen_type drm_get_connector_type(drmModeConnector *connector);
+static void drm_unset_mode( struct drm_t *drm );
+static void drm_unset_connector( struct drm_t *drm );
+
+inline uint64_t drm_calc_s31_32(float val)
+{
+	// S31.32 sign-magnitude
+	float integral = 0.0f;
+	float fractional = modf( fabsf( val ), &integral );
+
+	union
+	{
+		struct
+		{
+			uint64_t fractional : 32;
+			uint64_t integral   : 31;
+			uint64_t sign_part  : 1;
+		} s31_32_bits;
+		uint64_t s31_32;
+	} color;
+
+	color.s31_32_bits.sign_part  = val < 0 ? 1 : 0;
+	color.s31_32_bits.integral   = uint64_t( integral );
+	color.s31_32_bits.fractional = uint64_t( fractional * float( 1ull << 32 ) );
+
+	return color.s31_32;
+}
+
 
 static struct fb& get_fb( struct drm_t& drm, uint32_t id )
 {
@@ -373,14 +401,10 @@ drm_hdr_parse_edid(drm_t *drm, struct connector *connector, const struct di_edid
 		infoframe->metadata_type = 0;
 		infoframe->eotf = HDMI_EOTF_ST2084;
 
-		int ret = drmModeCreatePropertyBlob(drm->fd,
-											&metadata->defaultHdrMetadata,
-											sizeof(metadata->defaultHdrMetadata),
-											&metadata->hdr10_metadata_blob);
+		metadata->hdr10_metadata_blob = drm_create_hdr_metadata_blob(drm, &metadata->defaultHdrMetadata);
 
-		if (ret != 0) {
-			fprintf(stderr, "Failed to create blob for HDR_OUTPUT_METADATA. (%s) Falling back to null blob.\n", strerror(-ret));
-			metadata->hdr10_metadata_blob = 0;
+		if (metadata->hdr10_metadata_blob == nullptr) {
+			fprintf(stderr, "Failed to create blob for HDR_OUTPUT_METADATA. Falling back to null blob.\n");
 		}
 	}
 }
@@ -490,8 +514,7 @@ static bool refresh_state( drm_t *drm )
 
 			free(conn->name);
 			conn->name = nullptr;
-			drmModeDestroyPropertyBlob(drm->fd, conn->metadata.hdr10_metadata_blob);
-			conn->metadata.hdr10_metadata_blob = 0;
+			conn->metadata.hdr10_metadata_blob = nullptr;
 			drmModeFreeConnector(conn->connector);
 			it = drm->connectors.erase(it);
 		} else {
@@ -505,8 +528,7 @@ static bool refresh_state( drm_t *drm )
 	for (auto &kv : drm->connectors) {
 		struct connector *conn = &kv.second;
 		if (conn->connector != nullptr) {
-			drmModeDestroyPropertyBlob(drm->fd, conn->metadata.hdr10_metadata_blob);
-			conn->metadata.hdr10_metadata_blob = 0;
+			conn->metadata.hdr10_metadata_blob = nullptr;
 			drmModeFreeConnector(conn->connector);
 		}
 
@@ -549,7 +571,7 @@ static bool refresh_state( drm_t *drm )
 		if (conn->has_colorspace)
 			conn->current.colorspace = conn->initial_prop_values["Colorspace"];
 		if (conn->has_hdr_output_metadata)
-			conn->current.hdr_output_metadata = conn->initial_prop_values["HDR_OUTPUT_METADATA"];
+			conn->current.hdr_output_metadata = std::make_shared<wlserver_hdr_metadata>(conn->initial_prop_values["HDR_OUTPUT_METADATA"], false);
 		if (conn->has_content_type)
 			conn->current.content_type = conn->initial_prop_values["content type"];
 
@@ -578,6 +600,9 @@ static bool refresh_state( drm_t *drm )
 		crtc->has_vrr_enabled = crtc->props.contains( "VRR_ENABLED" );
 		if (!crtc->has_vrr_enabled)
 			drm_log.infof("CRTC %" PRIu32 " has no VRR_ENABLED support", crtc->id);
+		crtc->has_valve1_regamma_tf = crtc->props.contains( "VALVE1_CRTC_REGAMMA_TF" );
+		if (!crtc->has_valve1_regamma_tf)
+			drm_log.infof("CRTC %" PRIu32 " has no VALVE1_CRTC_REGAMMA_TF support", crtc->id);
 
 		crtc->lut3d_size = crtc->props.contains( "VALVE1_LUT3D_SIZE" ) ? uint32_t(crtc->initial_prop_values["VALVE1_LUT3D_SIZE"]) : 0;
 		crtc->shaperlut_size = crtc->props.contains( "VALVE1_SHAPER_LUT_SIZE" ) ? uint32_t(crtc->initial_prop_values["VALVE1_SHAPER_LUT_SIZE"]) : 0;
@@ -585,6 +610,8 @@ static bool refresh_state( drm_t *drm )
 		crtc->current.active = crtc->initial_prop_values["ACTIVE"];
 		if (crtc->has_vrr_enabled)
 			drm->current.vrr_enabled = crtc->initial_prop_values["VRR_ENABLED"];
+		if (crtc->has_valve1_regamma_tf)
+			drm->current.regamma_tf = (drm_valve1_transfer_function) crtc->initial_prop_values["VALVE1_CRTC_REGAMMA_TF"];
 	}
 
 	for (size_t i = 0; i < drm->planes.size(); i++) {
@@ -778,11 +805,15 @@ static bool setup_best_connector(struct drm_t *drm, bool force)
 		}
 	}
 
-	if ( best == nullptr ) {
-		/* we could be fancy and listen for hotplug events and wait for
-		 * a connector.. */
-		drm_log.errorf("cannot find any connector!");
-		return false;
+	if (best == nullptr) {
+		drm_log.infof("cannot find any connected connector!");
+		drm_unset_connector(drm);
+		drm_unset_mode(drm);
+		const struct wlserver_output_info wlserver_output_info = {
+			.description = "Virtual screen",
+		};
+		wlserver_set_output_info(&wlserver_output_info);
+		return true;
 	}
 
 	if (!drm_set_connector(drm, best)) {
@@ -946,7 +977,7 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh, bool wants_
 
 	drm->connector_priorities = parse_connector_priorities( g_sOutputName );
 
-	if (!setup_best_connector(drm, false)) {
+	if (!setup_best_connector(drm, true)) {
 		return false;
 	}
 
@@ -957,7 +988,17 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh, bool wants_
 			return false;
 	}
 
-	if (!get_plane_formats(drm, drm->primary, &drm->primary_formats)) {
+	// TODO: intersect primary planes formats instead
+	struct plane *primary_plane = drm->primary;
+	if (primary_plane == nullptr) {
+		primary_plane = find_primary_plane(drm);
+	}
+	if (primary_plane == nullptr) {
+		drm_log.errorf("Failed to find a primary plane");
+		return false;
+	}
+
+	if (!get_plane_formats(drm, primary_plane, &drm->primary_formats)) {
 		return false;
 	}
 
@@ -983,6 +1024,10 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh, bool wants_
 	if (g_bUseLayers) {
 		liftoff_log_set_priority(g_bDebugLayers ? LIFTOFF_DEBUG : LIFTOFF_ERROR);
 	}
+
+	hdr_output_metadata sdr_metadata;
+	memset(&sdr_metadata, 0, sizeof(sdr_metadata));
+	drm->sdr_static_metadata = drm_create_hdr_metadata_blob(drm, &sdr_metadata);
 
 	drm->flipcount = 0;
 	drm->needs_modeset = true;
@@ -1023,6 +1068,15 @@ static int add_plane_property(drmModeAtomicReq *req, struct plane *plane, const 
 	return add_property(req, plane->id, plane->props, name, value);
 }
 
+static std::shared_ptr<wlserver_hdr_metadata> get_default_hdr_metadata(struct drm_t *drm, struct connector *connector)
+{
+	if ( !connector->has_hdr_output_metadata )
+		return nullptr;
+	if ( !connector->metadata.supportsST2084 )
+		return nullptr;
+	return drm->sdr_static_metadata;
+}
+
 void finish_drm(struct drm_t *drm)
 {
 	// Disable all connectors, CRTCs and planes. This is necessary to leave a
@@ -1036,8 +1090,13 @@ void finish_drm(struct drm_t *drm)
 		add_connector_property(req, conn, "CRTC_ID", 0);
 		if (conn->has_colorspace)
 			add_connector_property(req, conn, "Colorspace", 0);
+		// HACK HACK: Setting to 0 doesn't disable HDR properly.
+		// Set an SDR metadata blob.
 		if (conn->has_hdr_output_metadata)
-			add_connector_property(req, conn, "HDR_OUTPUT_METADATA", 0);
+		{
+			auto metadata = get_default_hdr_metadata( drm, conn );
+			add_connector_property(req, conn, "HDR_OUTPUT_METADATA", metadata ? metadata->blob : 0);
+		}
 		if (conn->has_content_type)
 			add_connector_property(req, conn, "content type", 0);
 	}
@@ -1055,6 +1114,8 @@ void finish_drm(struct drm_t *drm)
 			add_crtc_property(req, &drm->crtcs[i], "VALVE1_SHAPER_LUT", 0);
 		if ( drm->crtcs[i].has_vrr_enabled )
 			add_crtc_property(req, &drm->crtcs[i], "VRR_ENABLED", 0);
+		if ( drm->crtcs[i].has_valve1_regamma_tf )
+			add_crtc_property(req, &drm->crtcs[i], "VALVE1_CRTC_REGAMMA_TF", 0);
 		add_crtc_property(req, &drm->crtcs[i], "ACTIVE", 0);
 	}
 	for ( size_t i = 0; i < drm->planes.size(); i++ ) {
@@ -1073,6 +1134,10 @@ void finish_drm(struct drm_t *drm)
 			add_plane_property(req, plane, "rotation", DRM_MODE_ROTATE_0);
 		if (plane->props.count("alpha") > 0)
 			add_plane_property(req, plane, "alpha", 0xFFFF);
+		if (plane->props.count("VALVE1_PLANE_HDR_MULT") > 0)
+			add_plane_property(req, plane, "VALVE1_PLANE_HDR_MULT", 0x100000000ULL);
+		if (plane->props.count("VALVE1_PLANE_DEGAMMA_TF") > 0)
+			add_plane_property(req, plane, "VALVE1_PLANE_DEGAMMA_TF", DRM_VALVE1_TRANSFER_FUNCTION_DEFAULT );
 	}
 	// We can't do a non-blocking commit here or else risk EBUSY in case the
 	// previous page-flip is still in flight.
@@ -1104,19 +1169,25 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 // 	add_crtc_property(req, drm->crtc_id, "OUT_FENCE_PTR",
 // 					  (uint64_t)(unsigned long)&drm->kms_out_fence_fd);
 
-	drm->flip_lock.lock();
-
-	// Do it before the commit, as otherwise the pageflip handler could
-	// potentially beat us to the refcount checks.
-	for ( uint32_t i = 0; i < drm->fbids_in_req.size(); i++ )
-	{
-		struct fb &fb = get_fb( g_DRM, drm->fbids_in_req[ i ] );
-		assert( fb.held_refs );
-		fb.n_refs++;
-	}
 
 	assert( drm->fbids_queued.size() == 0 );
-	drm->fbids_queued = drm->fbids_in_req;
+
+	bool isPageFlip = drm->flags & DRM_MODE_PAGE_FLIP_EVENT;
+
+	if ( isPageFlip ) {
+		drm->flip_lock.lock();
+
+		// Do it before the commit, as otherwise the pageflip handler could
+		// potentially beat us to the refcount checks.
+		for ( uint32_t i = 0; i < drm->fbids_in_req.size(); i++ )
+		{
+			struct fb &fb = get_fb( g_DRM, drm->fbids_in_req[ i ] );
+			assert( fb.held_refs );
+			fb.n_refs++;
+		}
+
+		drm->fbids_queued = drm->fbids_in_req;
+	}
 
 	g_DRM.flipcount++;
 
@@ -1131,7 +1202,8 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 		if ( ret != -EBUSY && ret != -EACCES )
 		{
 			drm_log.errorf( "fatal flip error, aborting" );
-			drm->flip_lock.unlock();
+			if ( isPageFlip )
+				drm->flip_lock.unlock();
 			abort();
 		}
 
@@ -1157,7 +1229,8 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 
 		g_DRM.flipcount--;
 
-		drm->flip_lock.unlock();
+		if ( isPageFlip )
+			drm->flip_lock.unlock();
 
 		goto out;
 	} else {
@@ -1193,9 +1266,11 @@ int drm_commit(struct drm_t *drm, const struct FrameInfo_t *frameInfo )
 	// not when it is successfully queued.
 	g_uVblankDrawTimeNS = get_time_in_nanos() - g_SteamCompMgrVBlankTime;
 
-	// Wait for flip handler to unlock
-	drm->flip_lock.lock();
-	drm->flip_lock.unlock();
+	if ( isPageFlip ) {
+		// Wait for flip handler to unlock
+		drm->flip_lock.lock();
+		drm->flip_lock.unlock();
+	}
 
 // 	if (drm->kms_in_fence_fd != -1) {
 // 		close(drm->kms_in_fence_fd);
@@ -1561,6 +1636,7 @@ struct LiftoffStateCacheEntry
 		uint32_t crtcX, crtcY, crtcW, crtcH;
 		drm_color_encoding colorEncoding;
 		drm_color_range    colorRange;
+		drm_valve1_transfer_function transferFunction;
 	} layerState[ k_nMaxLayers ];
 
 	bool operator == (const LiftoffStateCacheEntry& entry) const
@@ -1587,6 +1663,7 @@ struct LiftoffStateCacheEntryKasher
 			hash_combine(hash, k.layerState[i].crtcH);
 			hash_combine(hash, k.layerState[i].colorEncoding);
 			hash_combine(hash, k.layerState[i].colorRange);
+			hash_combine(hash, k.layerState[i].transferFunction);
 		}
 
 		return hash;
@@ -1596,7 +1673,25 @@ struct LiftoffStateCacheEntryKasher
 
 std::unordered_set<LiftoffStateCacheEntry, LiftoffStateCacheEntryKasher> g_LiftoffStateCache;
 
-LiftoffStateCacheEntry FrameInfoToLiftoffStateCacheEntry( const FrameInfo_t *frameInfo )
+static inline drm_valve1_transfer_function convert_colorspace(GamescopeAppTextureColorspace colorspace)
+{
+	switch ( colorspace )
+	{
+		default:
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB:
+			return DRM_VALVE1_TRANSFER_FUNCTION_SRGB;
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB:
+			// Use LINEAR TF for scRGB float format as 80 nit = 1.0 in scRGB, which matches
+			// what PQ TF decodes to/encodes from.
+			// AMD internal format is FP16, and generally expected for 1.0 -> 80 nit.
+			// which just so happens to match scRGB.
+			return DRM_VALVE1_TRANSFER_FUNCTION_LINEAR;
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ:
+			return DRM_VALVE1_TRANSFER_FUNCTION_PQ;
+	}
+}
+
+LiftoffStateCacheEntry FrameInfoToLiftoffStateCacheEntry( struct drm_t *drm, const FrameInfo_t *frameInfo )
 {
 	LiftoffStateCacheEntry entry{};
 
@@ -1635,6 +1730,12 @@ LiftoffStateCacheEntry FrameInfoToLiftoffStateCacheEntry( const FrameInfo_t *fra
 		{
 			entry.layerState[i].colorEncoding = drm_get_color_encoding( g_ForcedNV12ColorSpace );
 			entry.layerState[i].colorRange    = drm_get_color_range( g_ForcedNV12ColorSpace );
+			entry.layerState[i].transferFunction = DRM_VALVE1_TRANSFER_FUNCTION_DEFAULT;
+		}
+		else
+		{
+			if ( drm_supports_hdr_planes( drm ) )
+				entry.layerState[i].transferFunction = convert_colorspace(frameInfo->layers[ i ].colorspace);
 		}
 	}
 
@@ -1655,10 +1756,12 @@ static bool is_liftoff_caching_enabled()
 	return !disabled;
 }
 
+extern float g_flLinearToNits;
+
 static int
 drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, bool needs_modeset )
 {
-	auto entry = FrameInfoToLiftoffStateCacheEntry( frameInfo );
+	auto entry = FrameInfoToLiftoffStateCacheEntry( drm, frameInfo );
 
 	// If we are modesetting, reset the state cache, we might
 	// move to another CRTC or whatever which might have differing caps.
@@ -1705,12 +1808,35 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			{
 				liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_ENCODING", entry.layerState[i].colorEncoding );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_RANGE",    entry.layerState[i].colorRange );
+				if ( drm_supports_hdr_planes( drm ) )
+					liftoff_layer_set_property( drm->lo_layers[ i ], "VALVE1_PLANE_DEGAMMA_TF", DRM_VALVE1_TRANSFER_FUNCTION_BT709 );
 			}
 			else
 			{
 				liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_ENCODING" );
 				liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_RANGE" );
+				if ( drm_supports_hdr_planes( drm ) )
+					liftoff_layer_set_property( drm->lo_layers[ i ], "VALVE1_PLANE_DEGAMMA_TF", entry.layerState[i].transferFunction );
 			}
+
+			if ( g_bOutputHDREnabled && drm_supports_hdr_planes( drm ) && ( entry.layerState[i].transferFunction == DRM_VALVE1_TRANSFER_FUNCTION_SRGB ) )
+			{
+				// Multiplier to 'gain' the plane.
+				// When PQ is decoded using the fixed func transfer function to the internal FP16 fb,
+				// 1.0 -> 80 nits (on AMD at least)
+				// When sRGB is decoded, 1.0 -> 1.0, obviously.
+				// Therefore, 1.0 multiplier = 80 nits for SDR content.
+				// So if you want, 203 nits for SDR content, pass in (203.0 / 80.0).
+				if ( drm_supports_hdr_planes( drm ) )
+					liftoff_layer_set_property( drm->lo_layers[ i ], "VALVE1_PLANE_HDR_MULT", drm_calc_s31_32( g_flLinearToNits / 80.0f ) );
+			}
+			else
+			{
+				// 1.0 in S32.31 is 0x100000000LL
+				if ( drm_supports_hdr_planes( drm ) )
+					liftoff_layer_set_property( drm->lo_layers[ i ], "VALVE1_PLANE_HDR_MULT", 0x100000000ULL );
+			}
+
 		}
 		else
 		{
@@ -1718,6 +1844,12 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 
 			liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_ENCODING" );
 			liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_RANGE" );
+
+			if ( drm_supports_hdr_planes( drm ) )
+			{
+				liftoff_layer_set_property( drm->lo_layers[ i ], "VALVE1_PLANE_DEGAMMA_TF", DRM_VALVE1_TRANSFER_FUNCTION_DEFAULT );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "VALVE1_PLANE_HDR_MULT", 0x100000000ULL );
+			}
 		}
 	}
 
@@ -1751,10 +1883,6 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
  * negative errno on failure or if the scene-graph can't be presented directly. */
 int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameInfo )
 {
-	if (!(drm->connector)){
-		return -EACCES;
-	}
-	
 	drm->pending.screen_type = drm_get_screen_type(drm);
 
 	drm_update_gamma_lut(drm);
@@ -1771,31 +1899,43 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	assert( drm->req == nullptr );
 	drm->req = drmModeAtomicAlloc();
 
-	if (drm->connector->has_colorspace) {
-		drm->connector->pending.colorspace = g_bOutputHDREnabled ? DRM_MODE_COLORIMETRY_BT2020_RGB : DRM_MODE_COLORIMETRY_DEFAULT;
-	}
-
-	if (drm->connector->has_content_type) {
-		drm->connector->pending.content_type = DRM_MODE_CONTENT_TYPE_GAME;
-	}
-
-	if (drm->connector->has_hdr_output_metadata) {
-		uint32_t hdr_output_metadata_blob = 0;
-		if ( g_bOutputHDREnabled ) {
-			hdr_output_metadata_blob = drm->connector->metadata.hdr10_metadata_blob;
-
-			auto feedback = steamcompmgr_get_base_layer_swapchain_feedback();
-			if (feedback && feedback->hdr_metadata_blob)
-				hdr_output_metadata_blob = feedback->hdr_metadata_blob;
+	if (drm->connector != nullptr) {
+		if (drm->connector->has_colorspace) {
+			drm->connector->pending.colorspace = g_bOutputHDREnabled ? DRM_MODE_COLORIMETRY_BT2020_RGB : DRM_MODE_COLORIMETRY_DEFAULT;
 		}
 
-		drm->connector->pending.hdr_output_metadata = hdr_output_metadata_blob;
+		if (drm->connector->has_content_type) {
+			drm->connector->pending.content_type = DRM_MODE_CONTENT_TYPE_GAME;
+		}
+
+		if (drm->connector->has_hdr_output_metadata) {
+			auto hdr_output_metadata = get_default_hdr_metadata( drm, drm->connector );
+			if ( g_bOutputHDREnabled ) {
+				if ( drm->connector->metadata.hdr10_metadata_blob )
+					hdr_output_metadata = drm->connector->metadata.hdr10_metadata_blob;
+
+				auto feedback = steamcompmgr_get_base_layer_swapchain_feedback();
+				if (feedback && feedback->hdr_metadata_blob)
+					hdr_output_metadata = feedback->hdr_metadata_blob;
+			}
+
+			drm->connector->pending.hdr_output_metadata = hdr_output_metadata;
+		}
+	}
+
+	if (drm_supports_hdr_planes(drm)) {
+		drm->pending.regamma_tf = g_bOutputHDREnabled
+			? DRM_VALVE1_TRANSFER_FUNCTION_PQ
+			: DRM_VALVE1_TRANSFER_FUNCTION_SRGB;
+	} else {
+		drm->pending.regamma_tf = DRM_VALVE1_TRANSFER_FUNCTION_DEFAULT;
 	}
 
 	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
 
 	// We do internal refcounting with these events
-	flags |= DRM_MODE_PAGE_FLIP_EVENT;
+	if ( drm->crtc != nullptr )
+		flags |= DRM_MODE_PAGE_FLIP_EVENT;
 
 	if ( async )
 		flags |= DRM_MODE_PAGE_FLIP_ASYNC;
@@ -1842,8 +1982,9 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 			if (crtc->current.active == 0)
 				continue;
 
-			if (add_crtc_property(drm->req, crtc, "MODE_ID", 0) < 0)
-				return false;
+			int ret = add_crtc_property(drm->req, crtc, "MODE_ID", 0);
+			if (ret < 0)
+				return ret;
 			if (crtc->has_gamma_lut)
 			{
 				int ret = add_crtc_property(drm->req, crtc, "GAMMA_LUT", 0);
@@ -1880,160 +2021,188 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 				if (ret < 0)
 					return ret;
 			}
+			if (crtc->has_valve1_regamma_tf)
+			{
+				int ret = add_crtc_property(drm->req, crtc, "VALVE1_CRTC_REGAMMA_TF", 0);
+				if (ret < 0)
+					return ret;
+			}
 
-			int ret = add_crtc_property(drm->req, crtc, "ACTIVE", 0);
+			ret = add_crtc_property(drm->req, crtc, "ACTIVE", 0);
 			if (ret < 0)
 				return ret;
 			crtc->pending.active = 0;
 		}
 
 		// Then enable the one we've picked
-
 		int ret = 0;
-
-		// Always set our CRTC_ID for the modeset, especially
-		// as we zero-ed it above.
-		drm->connector->pending.crtc_id = drm->crtc->id;
-		ret = add_connector_property(drm->req, drm->connector, "CRTC_ID", drm->crtc->id);
-		if (ret < 0)
-			return ret;
-
-		if (drm->connector->has_colorspace) {
-			ret = add_connector_property(drm->req, drm->connector, "Colorspace", drm->connector->pending.colorspace);
+		if (drm->connector != nullptr) {
+			// Always set our CRTC_ID for the modeset, especially
+			// as we zero-ed it above.
+			drm->connector->pending.crtc_id = drm->crtc->id;
+			ret = add_connector_property(drm->req, drm->connector, "CRTC_ID", drm->crtc->id);
 			if (ret < 0)
 				return ret;
-		}
 
-		if (drm->connector->has_hdr_output_metadata) {
-			ret = add_connector_property(drm->req, drm->connector, "HDR_OUTPUT_METADATA", drm->connector->pending.hdr_output_metadata);
+			if (drm->connector->has_colorspace) {
+				ret = add_connector_property(drm->req, drm->connector, "Colorspace", drm->connector->pending.colorspace);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->connector->has_hdr_output_metadata) {
+				uint32_t value = drm->connector->pending.hdr_output_metadata ? drm->connector->pending.hdr_output_metadata->blob : 0;
+				ret = add_connector_property(drm->req, drm->connector, "HDR_OUTPUT_METADATA", value);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->connector->has_content_type) {
+				ret = add_connector_property(drm->req, drm->connector, "content type", drm->connector->pending.content_type);
+				if (ret < 0)
+					return ret;
+			}
+
+			ret = add_crtc_property(drm->req, drm->crtc, "MODE_ID", drm->pending.mode_id);
 			if (ret < 0)
 				return ret;
-		}
 
-		if (drm->connector->has_content_type) {
-			ret = add_connector_property(drm->req, drm->connector, "content type", drm->connector->pending.content_type);
+			if (drm->crtc->has_gamma_lut)
+			{
+				ret = add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->crtc->has_degamma_lut)
+			{
+				ret = add_crtc_property(drm->req, drm->crtc, "DEGAMMA_LUT", drm->pending.degamma_lut_id);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->crtc->has_ctm)
+			{
+				ret = add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->crtc->lut3d_size)
+			{
+				ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_LUT3D", drm->pending.lut3d_id);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->crtc->shaperlut_size)
+			{
+				ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_SHAPER_LUT", drm->pending.shaperlut_id);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->crtc->has_vrr_enabled)
+			{
+				ret = add_crtc_property(drm->req, drm->crtc, "VRR_ENABLED", drm->pending.vrr_enabled);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->crtc->has_valve1_regamma_tf)
+			{
+				ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_CRTC_REGAMMA_TF", drm->pending.regamma_tf);
+				if (ret < 0)
+					return ret;
+			}
+
+			ret = add_crtc_property(drm->req, drm->crtc, "ACTIVE", 1);
 			if (ret < 0)
 				return ret;
+			drm->crtc->pending.active = 1;
 		}
-
-		ret = add_crtc_property(drm->req, drm->crtc, "MODE_ID", drm->pending.mode_id);
-		if (ret < 0)
-			return ret;
-
-		if (drm->crtc->has_gamma_lut)
-		{
-			ret = add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id);
-			if (ret < 0)
-				return false;
-		}
-
-		if (drm->crtc->has_degamma_lut)
-		{
-			ret = add_crtc_property(drm->req, drm->crtc, "DEGAMMA_LUT", drm->pending.degamma_lut_id);
-			if (ret < 0)
-				return false;
-		}
-
-		if (drm->crtc->has_ctm)
-		{
-			ret = add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id);
-			if (ret < 0)
-				return false;
-		}
-
-		if (drm->crtc->lut3d_size)
-		{
-			ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_LUT3D", drm->pending.lut3d_id);
-			if (ret < 0)
-				return false;
-		}
-
-		if (drm->crtc->shaperlut_size)
-		{
-			ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_SHAPER_LUT", drm->pending.shaperlut_id);
-			if (ret < 0)
-				return false;
-		}
-
-		if (drm->crtc->has_vrr_enabled)
-		{
-			ret = add_crtc_property(drm->req, drm->crtc, "VRR_ENABLED", drm->pending.vrr_enabled);
-			if (ret < 0)
-				return false;
-		}
-
-		ret = add_crtc_property(drm->req, drm->crtc, "ACTIVE", 1);
-		if (ret < 0)
-			return false;
-		drm->crtc->pending.active = 1;
 	}
 	else
 	{
-		if (drm->connector->has_colorspace && drm->connector->pending.colorspace != drm->connector->current.colorspace) {
-			int ret = add_connector_property(drm->req, drm->connector, "Colorspace", drm->connector->pending.colorspace);
-			if (ret < 0)
-				return ret;
+		if (drm->connector != nullptr) {
+			if (drm->connector->has_colorspace && drm->connector->pending.colorspace != drm->connector->current.colorspace) {
+				int ret = add_connector_property(drm->req, drm->connector, "Colorspace", drm->connector->pending.colorspace);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->connector->has_hdr_output_metadata && drm->connector->pending.hdr_output_metadata != drm->connector->current.hdr_output_metadata) {
+				uint32_t value = drm->connector->pending.hdr_output_metadata ? drm->connector->pending.hdr_output_metadata->blob : 0;
+				int ret = add_connector_property(drm->req, drm->connector, "HDR_OUTPUT_METADATA", value);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (drm->connector->has_content_type && drm->connector->pending.content_type != drm->connector->current.content_type) {
+				int ret = add_connector_property(drm->req, drm->connector, "content type", drm->connector->pending.content_type);
+				if (ret < 0)
+					return ret;
+			}
 		}
 
-		if (drm->connector->has_hdr_output_metadata && drm->connector->pending.hdr_output_metadata != drm->connector->current.hdr_output_metadata) {
-			int ret = add_connector_property(drm->req, drm->connector, "HDR_OUTPUT_METADATA", drm->connector->pending.hdr_output_metadata);
-			if (ret < 0)
-				return ret;
-		}
+		if (drm->crtc != nullptr) {
+			if ( drm->crtc->has_gamma_lut && drm->pending.gamma_lut_id != drm->current.gamma_lut_id )
+			{
+				int ret = add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id);
+				if (ret < 0)
+					return ret;
+			}
 
-		if (drm->connector->has_content_type && drm->connector->pending.content_type != drm->connector->current.content_type) {
-			int ret = add_connector_property(drm->req, drm->connector, "content type", drm->connector->pending.content_type);
-			if (ret < 0)
-				return ret;
-		}
+			if ( drm->crtc->has_degamma_lut && drm->pending.degamma_lut_id != drm->current.degamma_lut_id )
+			{
+				int ret = add_crtc_property(drm->req, drm->crtc, "DEGAMMA_LUT", drm->pending.degamma_lut_id);
+				if (ret < 0)
+					return ret;
+			}
 
-		if ( drm->crtc->has_gamma_lut && drm->pending.gamma_lut_id != drm->current.gamma_lut_id )
-		{
-			int ret = add_crtc_property(drm->req, drm->crtc, "GAMMA_LUT", drm->pending.gamma_lut_id);
-			if (ret < 0)
-				return ret;
-		}
+			if ( drm->crtc->has_ctm && drm->pending.ctm_id != drm->current.ctm_id )
+			{
+				int ret = add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id);
+				if (ret < 0)
+					return ret;
+			}
 
-		if ( drm->crtc->has_degamma_lut && drm->pending.degamma_lut_id != drm->current.degamma_lut_id )
-		{
-			int ret = add_crtc_property(drm->req, drm->crtc, "DEGAMMA_LUT", drm->pending.degamma_lut_id);
-			if (ret < 0)
-				return ret;
-		}
+			if ( drm->crtc->lut3d_size && drm->pending.lut3d_id != drm->current.lut3d_id )
+			{
+				int ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_LUT3D", drm->pending.lut3d_id);
+				if (ret < 0)
+					return ret;
+			}
 
-		if ( drm->crtc->has_ctm && drm->pending.ctm_id != drm->current.ctm_id )
-		{
-			int ret = add_crtc_property(drm->req, drm->crtc, "CTM", drm->pending.ctm_id);
-			if (ret < 0)
-				return ret;
-		}
+			if ( drm->crtc->shaperlut_size && drm->pending.shaperlut_id != drm->current.shaperlut_id )
+			{
+				int ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_SHAPER_LUT", drm->pending.shaperlut_id);
+				if (ret < 0)
+					return ret;
+			}
 
-		if ( drm->crtc->lut3d_size && drm->pending.lut3d_id != drm->current.lut3d_id )
-		{
-			int ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_LUT3D", drm->pending.lut3d_id);
-			if (ret < 0)
-				return ret;
-		}
+			if ( drm->crtc->has_vrr_enabled && drm->pending.vrr_enabled != drm->current.vrr_enabled )
+			{
+				int ret = add_crtc_property(drm->req, drm->crtc, "VRR_ENABLED", drm->pending.vrr_enabled );
+				if (ret < 0)
+					return ret;
+			}
 
-		if ( drm->crtc->shaperlut_size && drm->pending.shaperlut_id != drm->current.shaperlut_id )
-		{
-			int ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_SHAPER_LUT", drm->pending.shaperlut_id);
-			if (ret < 0)
-				return ret;
-		}
-
-		if ( drm->crtc->has_vrr_enabled && drm->pending.vrr_enabled != drm->current.vrr_enabled )
-		{
-			int ret = add_crtc_property(drm->req, drm->crtc, "VRR_ENABLED", drm->pending.vrr_enabled );
-			if (ret < 0)
-				return ret;
+			if ( drm->crtc->has_valve1_regamma_tf && drm->pending.regamma_tf != drm->current.regamma_tf )
+			{
+				int ret = add_crtc_property(drm->req, drm->crtc, "VALVE1_CRTC_REGAMMA_TF", drm->pending.regamma_tf );
+				if (ret < 0)
+					return ret;
+			}
 		}
 	}
 
 	drm->flags = flags;
 
 	int ret;
-	if ( g_bUseLayers == true ) {
+	if ( drm->crtc == nullptr ) {
+		ret = 0;
+	} else if ( g_bUseLayers == true ) {
 		ret = drm_prepare_liftoff( drm, frameInfo, needs_modeset );
 	} else {
 		ret = drm_prepare_basic( drm, frameInfo );
@@ -2134,6 +2303,24 @@ bool drm_set_connector( struct drm_t *drm, struct connector *conn )
 	drm->needs_modeset = true;
 
 	return true;
+}
+
+static void drm_unset_connector( struct drm_t *drm )
+{
+	drm->crtc = nullptr;
+	drm->primary = nullptr;
+
+	for ( int i = 0; i < k_nMaxLayers; i++ )
+	{
+		liftoff_layer_destroy( drm->lo_layers[ i ] );
+		drm->lo_layers[ i ] = nullptr;
+	}
+
+	liftoff_output_destroy(drm->lo_output);
+	drm->lo_output = nullptr;
+
+	drm->connector = nullptr;
+	drm->needs_modeset = true;
 }
 
 inline float srgb_to_linear( float fVal )
@@ -2306,8 +2493,9 @@ bool drm_set_degamma_exponent(struct drm_t *drm, float *vec, enum drm_screen_typ
 drm_screen_type drm_get_connector_type(drmModeConnector *connector)
 {
 	if (connector->connector_type == DRM_MODE_CONNECTOR_eDP ||
-		connector->connector_type == DRM_MODE_CONNECTOR_LVDS)
-		 return DRM_SCREEN_TYPE_INTERNAL;
+		connector->connector_type == DRM_MODE_CONNECTOR_LVDS ||
+		connector->connector_type == DRM_MODE_CONNECTOR_DSI)
+		return DRM_SCREEN_TYPE_INTERNAL;
 
 	return DRM_SCREEN_TYPE_EXTERNAL;
 }
@@ -2330,7 +2518,7 @@ inline uint16_t drm_quantize_lut_value( float flValue )
 	return (uint16_t)quantize( flValue, (float)UINT16_MAX );
 }
 
-inline uint16_t drm_calc_lut_value( float input, float flLinearGain, float flGain, float flBlend )
+inline uint16_t drm_calc_lut_value( float input, float flLinearGain, float flGain, float flBlend, drm_valve1_transfer_function regamma_tf )
 {
     float flValue = flerp( flGain * input, linear_to_srgb( flLinearGain * srgb_to_linear( input ) ), flBlend );
 	return drm_quantize_lut_value( flValue );
@@ -2338,7 +2526,7 @@ inline uint16_t drm_calc_lut_value( float input, float flLinearGain, float flGai
 
 bool drm_update_color_mtx(struct drm_t *drm)
 {
-	if ( !drm->crtc->has_ctm )
+	if ( drm->crtc == nullptr || !drm->crtc->has_ctm )
 		return true;
 
 	static constexpr float g_identity_mtx[9] =
@@ -2383,26 +2571,7 @@ bool drm_update_color_mtx(struct drm_t *drm)
 	{
 		const float val = drm->pending.color_mtx[screen_type][i];
 
-		// S31.32 sign-magnitude
-		float integral;
-		float fractional = modf( fabsf( val ), &integral );
-
-		union
-		{
-			struct
-			{
-				uint64_t fractional : 32;
-				uint64_t integral   : 31;
-				uint64_t sign_part  : 1;
-			} s31_32_bits;
-			uint64_t s31_32;
-		} color;
-
-		color.s31_32_bits.sign_part  = val < 0 ? 1 : 0;
-		color.s31_32_bits.integral   = uint64_t( integral );
-		color.s31_32_bits.fractional = uint64_t( fractional * float( 1ull << 32 ) );
-
-		drm_ctm.matrix[i] = color.s31_32;
+		drm_ctm.matrix[i] = drm_calc_s31_32(val);
 	}
 
 	uint32_t blob_id = 0;
@@ -2418,7 +2587,7 @@ bool drm_update_color_mtx(struct drm_t *drm)
 
 bool drm_update_lut3d(struct drm_t *drm)
 {
-	if ( !drm->crtc->lut3d_size )
+	if ( drm->crtc == nullptr || !drm->crtc->lut3d_size )
 		return true;
 
 	bool dirty = false;
@@ -2459,7 +2628,7 @@ bool drm_update_lut3d(struct drm_t *drm)
 
 bool drm_update_shaperlut(struct drm_t *drm)
 {
-	if ( !drm->crtc->shaperlut_size )
+	if ( drm->crtc == nullptr || !drm->crtc->shaperlut_size )
 		return true;
 
 	bool dirty = false;
@@ -2525,12 +2694,13 @@ static float safe_pow(float x, float y)
 
 bool drm_update_gamma_lut(struct drm_t *drm)
 {
-	if ( !drm->crtc->has_gamma_lut )
+	if ( drm->crtc == nullptr || !drm->crtc->has_gamma_lut )
 		return true;
 
 	enum drm_screen_type screen_type = drm->pending.screen_type;
 
-	if (drm->pending.color_gain[0] == drm->current.color_gain[0] &&
+	if (drm->pending.regamma_tf == drm->current.regamma_tf &&
+		drm->pending.color_gain[0] == drm->current.color_gain[0] &&
 		drm->pending.color_gain[1] == drm->current.color_gain[1] &&
 		drm->pending.color_gain[2] == drm->current.color_gain[2] &&
 		drm->pending.color_linear_gain[0] == drm->current.color_linear_gain[0] &&
@@ -2576,9 +2746,9 @@ bool drm_update_gamma_lut(struct drm_t *drm)
 		float g_exp = safe_pow( input, drm->pending.color_gamma_exponent[screen_type][1] );
 		float b_exp = safe_pow( input, drm->pending.color_gamma_exponent[screen_type][2] );
 
-		gamma_lut[i].red   = drm_calc_lut_value( r_exp, drm->pending.color_linear_gain[0], drm->pending.color_gain[0], drm->pending.gain_blend );
-		gamma_lut[i].green = drm_calc_lut_value( g_exp, drm->pending.color_linear_gain[1], drm->pending.color_gain[1], drm->pending.gain_blend );
-		gamma_lut[i].blue  = drm_calc_lut_value( b_exp, drm->pending.color_linear_gain[2], drm->pending.color_gain[2], drm->pending.gain_blend );
+		gamma_lut[i].red   = drm_calc_lut_value( r_exp, drm->pending.color_linear_gain[0], drm->pending.color_gain[0], drm->pending.gain_blend, drm->pending.regamma_tf );
+		gamma_lut[i].green = drm_calc_lut_value( g_exp, drm->pending.color_linear_gain[1], drm->pending.color_gain[1], drm->pending.gain_blend, drm->pending.regamma_tf );
+		gamma_lut[i].blue  = drm_calc_lut_value( b_exp, drm->pending.color_linear_gain[2], drm->pending.color_gain[2], drm->pending.gain_blend, drm->pending.regamma_tf );
 	}
 
 	uint32_t blob_id = 0;
@@ -2597,7 +2767,7 @@ bool drm_update_gamma_lut(struct drm_t *drm)
 
 bool drm_update_degamma_lut(struct drm_t *drm)
 {
-	if ( !drm->crtc->has_degamma_lut )
+	if ( drm->crtc == nullptr || !drm->crtc->has_degamma_lut )
 		return true;
 
 	enum drm_screen_type screen_type = drm->pending.screen_type;
@@ -2644,6 +2814,26 @@ bool drm_update_degamma_lut(struct drm_t *drm)
 	drm->pending.degamma_lut_id = blob_id;
 
 	return true;
+}
+
+static void drm_unset_mode( struct drm_t *drm )
+{
+	drm->pending.mode_id = 0;
+	drm->needs_modeset = true;
+
+	g_nOutputWidth = drm->preferred_width;
+	g_nOutputHeight = drm->preferred_height;
+	if (g_nOutputHeight == 0)
+		g_nOutputHeight = 720;
+	if (g_nOutputWidth == 0)
+		g_nOutputWidth = g_nOutputHeight * 16 / 9;
+
+	g_nOutputRefresh = drm->preferred_refresh;
+	if (g_nOutputRefresh == 0)
+		g_nOutputRefresh = 60;
+
+	g_drmEffectiveOrientation = DRM_MODE_ROTATE_0;
+	g_bRotated = false;
 }
 
 bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
@@ -2814,7 +3004,7 @@ std::pair<uint32_t, uint32_t> drm_get_connector_identifier(struct drm_t *drm)
 	return std::make_pair(drm->connector->connector->connector_type, drm->connector->connector->connector_type_id);
 }
 
-uint32_t drm_create_hdr_metadata_blob(struct drm_t *drm, hdr_output_metadata *metadata)
+std::shared_ptr<wlserver_hdr_metadata> drm_create_hdr_metadata_blob(struct drm_t *drm, hdr_output_metadata *metadata)
 {
 	uint32_t blob = 0;
 	int ret = drmModeCreatePropertyBlob(drm->fd, metadata, sizeof(*metadata), &blob);
@@ -2824,9 +3014,23 @@ uint32_t drm_create_hdr_metadata_blob(struct drm_t *drm, hdr_output_metadata *me
 		blob = 0;
 	}
 
-	return blob;
+	if (!blob)
+		return nullptr;
+
+	return std::make_shared<wlserver_hdr_metadata>(blob);
 }
 void drm_destroy_hdr_metadata_blob(struct drm_t *drm, uint32_t blob)
 {
 	drmModeDestroyPropertyBlob(drm->fd, blob);
+}
+
+bool drm_supports_hdr_planes(struct drm_t *drm)
+{
+	if (g_bForceDisableTransferFunctions)
+		return false;
+
+	if (!drm->crtc)
+		return false;
+
+	return drm->crtc->has_valve1_regamma_tf;
 }

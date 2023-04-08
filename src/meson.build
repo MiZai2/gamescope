@@ -27,8 +27,8 @@ wlroots_dep = dependency(
 )
 
 displayinfo_dep = dependency(
-  'display-info',
-  version: ['>= 0.0.0', '< 0.1.0'],
+  'libdisplay-info',
+  version: ['>= 0.0.0', '< 0.2.0'],
   fallback: ['libdisplay-info', 'di_dep'],
   default_options: ['default_library=static'],
 )
@@ -76,7 +76,7 @@ spirv_shaders = glsl_generator.process(shader_src)
 
 liftoff_dep = dependency(
   'libliftoff',
-  version: ['>= 0.3.0', '< 0.4.0'],
+  version: ['>= 0.4.0', '< 0.5.0'],
   fallback: ['libliftoff', 'liftoff'],
   default_options: ['default_library=static'],
 )

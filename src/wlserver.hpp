@@ -23,11 +23,6 @@ struct xwayland_ctx_t;
 
 struct wlserver_vk_swapchain_feedback
 {
-	~wlserver_vk_swapchain_feedback()
-	{
-		drm_destroy_hdr_metadata_blob( &g_DRM, hdr_metadata_blob );
-	}
-
 	uint32_t image_count;
 	VkFormat vk_format;
 	VkColorSpaceKHR vk_colorspace;
@@ -35,7 +30,8 @@ struct wlserver_vk_swapchain_feedback
 	VkSurfaceTransformFlagBitsKHR vk_pre_transform;
 	VkPresentModeKHR vk_present_mode;
 	VkBool32 vk_clipped;
-	uint32_t hdr_metadata_blob;
+
+	std::shared_ptr<wlserver_hdr_metadata> hdr_metadata_blob;
 };
 
 struct ResListEntry_t {
@@ -70,6 +66,7 @@ public:
 	std::vector<ResListEntry_t> retrieve_commits();
 
 	void handle_override_window_content( struct wl_client *client, struct wl_resource *resource, struct wl_resource *surface_resource, uint32_t x11_window );
+	void destroy_content_override( struct wlserver_x11_surface_info *x11_surface, struct wlr_surface *surf);
 	void destroy_content_override(struct wlserver_content_override *co);
 
 	struct wl_client *get_client();

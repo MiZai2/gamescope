@@ -8,6 +8,8 @@
 
 #include <string.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 
 static LogScope openvr_log("openvr");
 
@@ -167,9 +169,22 @@ bool vrsession_init()
     return true;
 }
 
+std::mutex g_OverlayVisibleMutex;
+std::condition_variable g_OverlayVisibleCV;
+std::atomic<bool> g_bOverlayVisible = { false };
+
 bool vrsession_visible()
 {
-    return vr::VROverlay()->IsOverlayVisible( GetVR().hOverlay ) || GetVR().bNudgeToVisible;
+    return g_bOverlayVisible.load();
+}
+
+void vrsession_wait_until_visible()
+{
+    if (vrsession_visible())
+        return;
+
+    std::unique_lock lock(g_OverlayVisibleMutex);
+    g_OverlayVisibleCV.wait( lock, []{ return g_bOverlayVisible.load(); } );
 }
 
 void vrsession_present( vr::VRVulkanTextureData_t *pTextureData )
@@ -315,6 +330,16 @@ static void vrsession_input_thread()
                     wlserver_open_steam_menu( button == vr::k_EButton_QAM );
                     break;
                 }
+
+                case vr::VREvent_OverlayShown:
+                case vr::VREvent_OverlayHidden:
+                {
+                    {
+                        std::unique_lock lock(g_OverlayVisibleMutex);
+                        g_bOverlayVisible = vrEvent.eventType == vr::VREvent_OverlayShown;
+                    }
+                    g_OverlayVisibleCV.notify_all();
+                }
             }
         }
         sleep_for_nanos(2'000'000);
@@ -327,6 +352,11 @@ void vrsession_update_touch_mode()
     vr::VROverlay()->SetOverlayFlag( GetVR().hOverlay, vr::VROverlayFlags_HideLaserIntersection, bHideLaserIntersection );
 }
 
+struct rgba_t
+{
+	uint8_t r,g,b,a;
+};
+
 void vrsession_title( const char *title, std::shared_ptr<std::vector<uint32_t>> icon )
 {
     if ( !GetVR().bExplicitOverlayName )
@@ -334,10 +364,19 @@ void vrsession_title( const char *title, std::shared_ptr<std::vector<uint32_t>> 
         vr::VROverlay()->SetOverlayName( GetVR().hOverlay, (title && *title) ? title : GetVR().pchOverlayName );
     }
 
-    if ( icon )
+    if ( icon && icon->size() >= 3 )
     {
-        int size = sqrt( icon->size() );
-        vr::VROverlay()->SetOverlayRaw( GetVR().hOverlayThumbnail, icon->data(), size, size, sizeof(uint32_t) );
+        const uint32_t width = (*icon)[0];
+        const uint32_t height = (*icon)[1];
+
+        for (uint32_t& val : *icon)
+        {
+            rgba_t rgb = *((rgba_t*)&val);
+            std::swap(rgb.r, rgb.b);
+            val = *((uint32_t*)&rgb);
+        }
+
+        vr::VROverlay()->SetOverlayRaw( GetVR().hOverlayThumbnail, &(*icon)[2], width, height, sizeof(uint32_t) );
     }
     else if ( GetVR().pchOverlayName )
     {

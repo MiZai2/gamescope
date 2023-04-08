@@ -23,6 +23,9 @@ static bool g_bWindowShown = false;
 static int g_nOldNestedRefresh = 0;
 static bool g_bWindowFocused = true;
 
+static int g_nOutputWidthPts = 0;
+static int g_nOutputHeightPts = 0;
+
 
 extern bool steamMode;
 extern bool g_bFirstFrame;
@@ -176,8 +179,8 @@ void inputSDLThreadRun( void )
 				{
 					wlserver_lock();
 					wlserver_touchmotion(
-						event.motion.x / float(g_nOutputWidth),
-						event.motion.y / float(g_nOutputHeight),
+						event.motion.x / float(g_nOutputWidthPts),
+						event.motion.y / float(g_nOutputHeightPts),
 						0,
 						fake_timestamp );
 					wlserver_unlock();
@@ -289,6 +292,10 @@ void inputSDLThreadRun( void )
 					case SDL_WINDOWEVENT_SIZE_CHANGED:
 						int width, height;
 						SDL_GetWindowSize( g_SDLWindow, &width, &height );
+						g_nOutputWidthPts = width;
+						g_nOutputHeightPts = height;
+
+						SDL_GetWindowSizeInPixels( g_SDLWindow, &width, &height );
 						g_nOutputWidth = width;
 						g_nOutputHeight = height;
 
@@ -334,16 +341,20 @@ void inputSDLThreadRun( void )
 					if ( g_bUpdateSDLWindowIcon )
 					{
 						if ( icon_surface )
-							SDL_FreeSurface( icon_surface );
-
-						if ( g_SDLWindowIcon )
 						{
-							uint32_t size = sqrt(g_SDLWindowIcon->size());
+							SDL_FreeSurface( icon_surface );
+							icon_surface = nullptr;
+						}
+
+						if ( g_SDLWindowIcon && g_SDLWindowIcon->size() >= 3 )
+						{
+							const uint32_t width = (*g_SDLWindowIcon)[0];
+        					const uint32_t height = (*g_SDLWindowIcon)[1];
 
 							icon_surface = SDL_CreateRGBSurfaceFrom(
-								g_SDLWindowIcon->data(),
-								size, size,
-								32, size * sizeof(uint32_t),
+								&(*g_SDLWindowIcon)[2],
+								width, height,
+								32, width * sizeof(uint32_t),
 								0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
 						}
 

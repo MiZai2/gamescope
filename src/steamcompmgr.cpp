@@ -990,24 +990,31 @@ void MouseCursor::checkSuspension()
 
 	bool bWasHidden = m_hideForMovement;
 
-	if (buttonMask & ( Button1Mask | Button2Mask | Button3Mask | Button4Mask | Button5Mask )) {
-		m_hideForMovement = false;
-		m_lastMovedTime = get_time_in_milliseconds();
+	steamcompmgr_win_t *window = m_ctx->focus.inputFocusWindow;
+	if (window && window->ignoreNextClickForVisibility)
+	{
+		window->ignoreNextClickForVisibility--;
+		m_hideForMovement = true;
+		return;
+	}
+	else
+	{
+		if (buttonMask & ( Button1Mask | Button2Mask | Button3Mask | Button4Mask | Button5Mask )) {
+			m_hideForMovement = false;
+			m_lastMovedTime = get_time_in_milliseconds();
 
-		// Move the cursor back to where we left it if the window didn't want us to give
-		// it hover/focus where we left it and we moved it before.
-		steamcompmgr_win_t *window = m_ctx->focus.inputFocusWindow;
-		if (window_wants_no_focus_when_mouse_hidden(window) && bWasHidden)
-		{
-			XWarpPointer(m_ctx->dpy, None, x11_win(m_ctx->focus.inputFocusWindow), 0, 0, 0, 0, m_lastX, m_lastY);
+			// Move the cursor back to where we left it if the window didn't want us to give
+			// it hover/focus where we left it and we moved it before.
+			if (window_wants_no_focus_when_mouse_hidden(window) && bWasHidden)
+			{
+				XWarpPointer(m_ctx->dpy, None, x11_win(m_ctx->focus.inputFocusWindow), 0, 0, 0, 0, m_lastX, m_lastY);
+			}
 		}
 	}
 
 	const bool suspended = get_time_in_milliseconds() - m_lastMovedTime > cursorHideTime;
 	if (!m_hideForMovement && suspended) {
 		m_hideForMovement = true;
-
-		steamcompmgr_win_t *window = m_ctx->focus.inputFocusWindow;
 
 		// Rearm warp count
 		if (window) {
@@ -1966,6 +1973,7 @@ paint_all(bool async)
 
 	bool bNeedsNearest = g_upscaleFilter == GamescopeUpscaleFilter::NEAREST && frameInfo.layers[0].scale.x != 1.0f && frameInfo.layers[0].scale.y != 1.0f;
 
+
 	bool bNeedsComposite = BIsNested();
 	bNeedsComposite |= alwaysComposite;
 	bNeedsComposite |= bCapture;
@@ -1976,8 +1984,20 @@ paint_all(bool async)
 	bNeedsComposite |= bNeedsNearest;
 	bNeedsComposite |= bDrewCursor;
 
-	// For now! We can avoid this in the future in some cases.
-	bNeedsComposite |= g_bOutputHDREnabled;
+	// Disable FSR if outputting HDR or not SDR colorspace game.
+	// We can fix the former at some point, but the latter is much harder.
+	if ( g_bOutputHDREnabled || !( frameInfo.layers[0].colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB || frameInfo.layers[0].colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR ) )
+	{
+		frameInfo.useFSRLayer0 = false;
+		frameInfo.useNISLayer0 = false;
+	}
+
+	if ( !BIsNested() && g_bOutputHDREnabled )
+	{
+		bNeedsComposite |= g_bHDRItmEnable;
+		if ( !drm_supports_hdr_planes(&g_DRM) )
+			bNeedsComposite |= ( frameInfo.layerCount > 1 || frameInfo.layers[0].colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ );
+	}
 	bNeedsComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
 
 	if ( !bNeedsComposite )
@@ -2050,7 +2070,7 @@ paint_all(bool async)
 			layer->fbid = layer->tex->fbid();
 
 			layer->linearFilter = false;
-			layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+			layer->colorspace = g_bOutputHDREnabled ? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
 
 			int ret = drm_prepare( &g_DRM, async, &frameInfo );
 
@@ -2350,9 +2370,13 @@ win_maybe_a_dropdown( steamcompmgr_win_t *w )
 	// Only do this if we have CONTROLPARENT right now. Some other apps, such as the
 	// Street Fighter V (310950) Splash Screen also use LAYERED and TOOLWINDOW, and we don't
 	// want that to be overlayed.
+	// Ignore LAYERED if it's marked as top-level with WS_EX_APPWINDOW.
 	// TODO: Find more apps using LAYERED.
 	const uint32_t validLayered = WS_EX_CONTROLPARENT | WS_EX_LAYERED;
-	if ( w->hasHwndStyleEx && ( ( w->hwndStyleEx & validLayered ) == validLayered ) )
+	const uint32_t invalidLayered = WS_EX_APPWINDOW;
+	if ( w->hasHwndStyleEx &&
+		( ( w->hwndStyleEx & validLayered   ) == validLayered ) &&
+		( ( w->hwndStyleEx & invalidLayered ) == 0 ) )
 		return true;
 
 	// Josh:
@@ -3176,7 +3200,22 @@ determine_and_apply_focus()
 	}
 
 	sdlwindow_visible( global_focus.focusWindow != nullptr );
-	
+
+	// Some games such as Disgaea PC (405900) don't take controller input until
+	// the window is first clicked on despite it having focus.
+	if ( global_focus.inputFocusWindow && global_focus.inputFocusWindow->appID == 405900 )
+	{
+		global_focus.inputFocusWindow->mouseMoved = 0;
+		global_focus.inputFocusWindow->ignoreNextClickForVisibility = 2;
+
+		auto now = get_time_in_milliseconds();
+
+		wlserver_lock();
+		wlserver_touchdown( 0.5, 0.5, 0, now );
+		wlserver_touchup( 0, now + 1 );
+		wlserver_unlock();
+	}
+
 	focusDirty = false;
 }
 
@@ -4698,7 +4737,7 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 	{
 		g_flLinearToNits = get_prop( ctx, ctx->root, ctx->atoms.gamescopeHDRSDRContentBrightness, 0 );
 		if ( g_flLinearToNits < 1.0f )
-			g_flLinearToNits = 400.0f;
+			g_flLinearToNits = 203.0f;
 		hasRepaint = true;
 	}
 	if ( ev->atom == ctx->atoms.gamescopeHDRItmEnable )
@@ -6356,7 +6395,11 @@ steamcompmgr_main(int argc, char **argv)
 						.format = 8,
 						.nitems = strlen(connectorEdidPath),
 					};
-					XSetTextProperty( root_ctx->dpy, root_ctx->root, &text_property, root_ctx->atoms.gamescopeDisplayEdidPath );
+					gamescope_xwayland_server_t *server = NULL;
+					for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+					{
+						XSetTextProperty( server->ctx->dpy, server->ctx->root, &text_property, server->ctx->atoms.gamescopeDisplayEdidPath );
+					}
 				}
 
 				g_LastConnectorIdentifier = connector_id;
@@ -6457,6 +6500,12 @@ steamcompmgr_main(int argc, char **argv)
 
 		const bool bVRR = drm_get_vrr_in_use( &g_DRM );
 
+		// HACK: Disable tearing if we have an overlay to avoid stutters right now
+		// TODO: Fix properly.
+		static bool bHasOverlay = ( global_focus.overlayWindow && global_focus.overlayWindow->opacity ) ||
+								( global_focus.externalOverlayWindow && global_focus.externalOverlayWindow->opacity ) ||
+								( global_focus.overrideWindow  && global_focus.focusWindow && !global_focus.focusWindow->isSteamStreamingClient && global_focus.overrideWindow->opacity );
+
 		const bool bSteamOverlayOpen  = global_focus.overlayWindow && global_focus.overlayWindow->opacity;
 		// If we are running behind, allow tearing.
 		const bool bSurfaceWantsAsync = (g_HeldCommits[HELD_COMMIT_BASE] && g_HeldCommits[HELD_COMMIT_BASE]->async);
@@ -6467,7 +6516,7 @@ steamcompmgr_main(int argc, char **argv)
 		// for composition to finish before submitting.
 		// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
 		const bool bNeedsSyncFlip = bForceSyncFlip || g_bCurrentlyCompositing || nIgnoredOverlayRepaints;
-		const bool bDoAsyncFlip   = ( ((g_nAsyncFlipsEnabled >= 1) && g_bSupportsAsyncFlips && bSurfaceWantsAsync) || bVRR ) && !bSteamOverlayOpen && !bNeedsSyncFlip;
+		const bool bDoAsyncFlip   = ( ((g_nAsyncFlipsEnabled >= 1) && g_bSupportsAsyncFlips && bSurfaceWantsAsync && !bHasOverlay) || bVRR ) && !bSteamOverlayOpen && !bNeedsSyncFlip;
 
 		bool bShouldPaint = false;
 		if ( bDoAsyncFlip )

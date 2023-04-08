@@ -32,6 +32,41 @@ enum drm_screen_type {
 	DRM_SCREEN_TYPE_COUNT
 };
 
+
+enum GamescopeAppTextureColorspace {
+	GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR = 0,
+	GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB,
+	GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB,
+	GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ,
+};
+const uint32_t GamescopeAppTextureColorspace_Bits = 2;
+
+extern struct drm_t g_DRM;
+void drm_destroy_hdr_metadata_blob(struct drm_t *drm, uint32_t blob);
+
+struct wlserver_hdr_metadata
+{
+	wlserver_hdr_metadata()
+	{
+
+	}
+
+	wlserver_hdr_metadata(uint32_t blob, bool owned = true)
+		: blob(blob)
+	{
+
+	}
+
+	~wlserver_hdr_metadata()
+	{
+		if ( blob && owned )
+			drm_destroy_hdr_metadata_blob( &g_DRM, blob );
+	}
+
+	uint32_t blob = 0;
+	bool owned = true;
+};
+
 #include <wayland-server-core.h>
 
 extern "C" {
@@ -72,6 +107,7 @@ struct crtc {
 	bool has_degamma_lut;
 	bool has_ctm;
 	bool has_vrr_enabled;
+	bool has_valve1_regamma_tf;
 	uint32_t lut3d_size;
 	uint32_t shaperlut_size;
 
@@ -82,7 +118,7 @@ struct crtc {
 
 struct connector_metadata_t {
    struct hdr_output_metadata defaultHdrMetadata = {};
-   uint32_t hdr10_metadata_blob = 0;
+   std::shared_ptr<wlserver_hdr_metadata> hdr10_metadata_blob;
    bool supportsST2084 = false;
 };
 
@@ -107,7 +143,7 @@ struct connector {
 		uint32_t crtc_id;
 		uint32_t colorspace;
 		uint32_t content_type;
-		uint32_t hdr_output_metadata;
+		std::shared_ptr<wlserver_hdr_metadata> hdr_output_metadata;
 	} current, pending;
 
 	bool has_colorspace;
@@ -125,6 +161,21 @@ struct fb {
 	int held_refs;
 	/* Number of page-flips using the FB */
 	std::atomic< uint32_t > n_refs;
+};
+
+enum drm_valve1_transfer_function {
+	DRM_VALVE1_TRANSFER_FUNCTION_DEFAULT,
+
+	DRM_VALVE1_TRANSFER_FUNCTION_SRGB,
+	DRM_VALVE1_TRANSFER_FUNCTION_BT709,
+	DRM_VALVE1_TRANSFER_FUNCTION_PQ,
+	DRM_VALVE1_TRANSFER_FUNCTION_LINEAR,
+	DRM_VALVE1_TRANSFER_FUNCTION_UNITY,
+	DRM_VALVE1_TRANSFER_FUNCTION_HLG,
+	DRM_VALVE1_TRANSFER_FUNCTION_GAMMA22,
+	DRM_VALVE1_TRANSFER_FUNCTION_GAMMA24,
+	DRM_VALVE1_TRANSFER_FUNCTION_GAMMA26,
+	DRM_VALVE1_TRANSFER_FUNCTION_MAX,
 };
 
 struct drm_t {
@@ -158,6 +209,8 @@ struct drm_t {
 	struct liftoff_output *lo_output;
 	struct liftoff_layer *lo_layers[ k_nMaxLayers ];
 
+	std::shared_ptr<wlserver_hdr_metadata> sdr_static_metadata;
+
 	struct {
 		uint32_t mode_id;
 		uint32_t gamma_lut_id;
@@ -183,6 +236,7 @@ struct drm_t {
 				0.0f, 0.0f, 1.0f,
 			},
 		};
+		drm_valve1_transfer_function regamma_tf = DRM_VALVE1_TRANSFER_FUNCTION_DEFAULT;
 		float gain_blend = 0.0f;
 		enum drm_screen_type screen_type = DRM_SCREEN_TYPE_INTERNAL;
 		bool vrr_enabled = false;
@@ -284,7 +338,8 @@ bool drm_get_vrr_capable(struct drm_t *drm);
 bool drm_supports_st2084(struct drm_t *drm);
 void drm_set_vrr_enabled(struct drm_t *drm, bool enabled);
 bool drm_get_vrr_in_use(struct drm_t *drm);
-uint32_t drm_create_hdr_metadata_blob(struct drm_t *drm, hdr_output_metadata *metadata);
+bool drm_supports_hdr_planes(struct drm_t *drm);
+std::shared_ptr<wlserver_hdr_metadata> drm_create_hdr_metadata_blob(struct drm_t *drm, hdr_output_metadata *metadata);
 void drm_destroy_hdr_metadata_blob(struct drm_t *drm, uint32_t blob);
 
 const char *drm_get_connector_name(struct drm_t *drm);

@@ -7,13 +7,14 @@
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnon-virtual-dtor"
-#include "../subprojects/openvr/headers/openvr.h"
+#include <openvr.h>
 #pragma GCC diagnostic pop
 
 bool vr_init(int argc, char **argv);
 
 bool vrsession_init();
 bool vrsession_visible();
+void vrsession_wait_until_visible();
 void vrsession_present( vr::VRVulkanTextureData_t *pTextureData );
 
 void vrsession_append_instance_exts( std::vector<const char *>& exts );
